@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+backup/
+reports/
+build/
+review_state.json
+sku_mapping_memory.json
+settings.ini
+*.xlsx
+*.xls
+*.csv
+
+# Keep the distributable executable, but ignore other generated files.
+dist/*
+!dist/调库匹配.exe
