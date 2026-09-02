@@ -59,9 +59,10 @@ from widgets import (
     CandidateCard, StatLabel, MappingEditorDialog,
     COLOR_CONFIRMED, COLOR_SUGGEST, COLOR_PENDING, COLOR_PRESALE, COLOR_SKIPPED,
     COLOR_KEEP, COLOR_ADOPT, COLOR_ZERO, COLOR_CUSTOM,
+    COLOR_AUTO_ZERO, COLOR_PRESALE_BONUS,
 )
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 AUTO_STATUS_DONE = "已确认"     # 高置信度自动命中
 AUTO_STATUS_ADV  = "建议"       # 低置信度建议复核
 AUTO_STATUS_PEND = "待手选"     # 未匹配，需人工选择
@@ -96,12 +97,15 @@ class AutoMatchWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, sales_path, stock_path, presale_path,
-                 include_presale=False, mapping_memory=None, combo_path="", parent=None):
+                 include_presale=False, mapping_memory=None, combo_path="",
+                 presale_bonus_enabled=True, low_stock_zero_enabled=True, parent=None):
         super().__init__(parent)
         self.sales_path = sales_path
         self.stock_path = stock_path
         self.presale_path = presale_path
         self.include_presale = bool(include_presale)
+        self.presale_bonus_enabled = bool(presale_bonus_enabled)
+        self.low_stock_zero_enabled = bool(low_stock_zero_enabled)
         self.mapping_memory = mapping_memory if mapping_memory is not None else load_mapping_memory()
         self.combo_path = combo_path or ""
         self.items = []
@@ -144,79 +148,74 @@ class AutoMatchWorker(QThread):
                 low_stock_zero = False
                 presale_bonus = 0
 
-                if is_presale and not self.include_presale:
-                    sku = ""
-                    auto_av = None
-                    auto_status = AUTO_STATUS_PRESALE
-                    desc = (f"预售单号：规格编号 {spec or '-'} 在出货天数资料中为 "
-                            f"{presale_days} 天，当前未开启预售调库")
-                    cands = []
+                remembered = resolve_remembered_mapping(f, self.mapping_memory, exact, norm)
+                if remembered is not None:
+                    sku, av = remembered
+                    st = "OK"
+                    memory_hit = True
+                    desc = f"历史记忆匹配：{sku}"
                 else:
-                    remembered = resolve_remembered_mapping(f, self.mapping_memory, exact, norm)
-                    if remembered is not None:
-                        sku, av = remembered
-                        st = "OK"
-                        memory_hit = True
-                        desc = f"历史记忆匹配：{sku}"
-                    else:
-                        st, sku, av, desc = matcher.match_one(f, tag="F")
+                    st, sku, av, desc = matcher.match_one(f, tag="F")
 
-                    # L8: E列主商品货号兜底
-                    if (not memory_hit and st not in ("OK", "部分匹配")
-                            and e and e.lower() != "nan"):
-                        st2, sku2, av2, desc2 = matcher.match_one(e, tag="E")
-                        if st2 == "OK":
-                            st, sku, av, desc = "OK", sku2, av2, f"E列兜底: {desc2}"
-                        elif st2 == "部分匹配":
-                            st, sku, av, desc = "部分匹配", sku2, av2, f"E列兜底: {desc2}"
+                # L8: E列主商品货号兜底
+                if (not memory_hit and st not in ("OK", "部分匹配")
+                        and e and e.lower() != "nan"):
+                    st2, sku2, av2, desc2 = matcher.match_one(e, tag="E")
+                    if st2 == "OK":
+                        st, sku, av, desc = "OK", sku2, av2, f"E列兜底: {desc2}"
+                    elif st2 == "部分匹配":
+                        st, sku, av, desc = "部分匹配", sku2, av2, f"E列兜底: {desc2}"
 
-                    # 组合表是低优先级兜底：普通规则已经命中时不查询；
-                    # 货号含 zuhe 或普通规则未命中时，用 F列组合自定义 SKU 查 B->C。
-                    combo_requested = bool(re.search(r"zuhe", f, re.IGNORECASE)) \
-                        or st not in ("OK", "部分匹配")
-                    if combo_mapping and combo_requested:
-                        combo_result = resolve_combo_inventory(
-                            f, combo_mapping, meta.get("system_index", {}))
-                        if combo_result["status"] == "OK":
-                            st = "组合表"
-                            sku = " + ".join(combo_result["system_skus"])
-                            av = combo_result["available"]
-                            combo_hit = True
-                            desc = (
-                                f"组合表兜底：B列组合自定义SKU {f!r} -> "
-                                f"C列子系统SKU {', '.join(combo_result['system_skus'])}；"
-                                f"组合可用库存 {av}")
-                        elif st not in ("OK", "部分匹配"):
-                            desc = f"{desc}；组合表查询：{combo_result['reason']}"
+                # 组合表是低优先级兜底：普通规则已经命中时不查询；
+                # 货号含 zuhe 或普通规则未命中时，用 F列组合自定义 SKU 查 B->C。
+                combo_requested = bool(re.search(r"zuhe", f, re.IGNORECASE)) \
+                    or st not in ("OK", "部分匹配")
+                if combo_mapping and combo_requested:
+                    combo_result = resolve_combo_inventory(
+                        f, combo_mapping, meta.get("system_index", {}))
+                    if combo_result["status"] == "OK":
+                        st = "组合表"
+                        sku = " + ".join(combo_result["system_skus"])
+                        av = combo_result["available"]
+                        combo_hit = True
+                        desc = (
+                            f"组合表兜底：B列组合自定义SKU {f!r} -> "
+                            f"C列子系统SKU {', '.join(combo_result['system_skus'])}；"
+                            f"组合可用库存 {av}")
+                    elif st not in ("OK", "部分匹配"):
+                        desc = f"{desc}；组合表查询：{combo_result['reason']}"
 
-                    if st == "OK":
+                if st == "OK":
+                    auto_status = AUTO_STATUS_DONE
+                    auto_av = av
+                elif st in ("部分匹配", "组合表"):
+                    auto_status = AUTO_STATUS_ADV
+                    auto_av = av
+                else:
+                    auto_status = AUTO_STATUS_PEND
+                    auto_av = None
+
+                # 规则只改变自动建议值；是否自动写回由预售参与开关和复核动作决定。
+                if auto_av is not None:
+                    if is_presale and self.presale_bonus_enabled:
+                        auto_av = auto_av + 9999
+                        presale_bonus = 9999
+                        desc += "；预售订单库存自动加 9999"
+                    elif (not is_presale and self.low_stock_zero_enabled
+                          and auto_av < 10):
+                        low_stock_zero = True
+                        desc += f"；匹配库存 {auto_av} 小于 10，自动调为 0"
+                        auto_av = 0
                         auto_status = AUTO_STATUS_DONE
-                        auto_av = av
-                    elif st in ("部分匹配", "组合表"):
-                        auto_status = AUTO_STATUS_ADV
-                        auto_av = av
-                    else:
-                        auto_status = AUTO_STATUS_PEND
-                        auto_av = None
-
-                    # 预售库存加 9999；普通商品匹配库存小于 10 时自动调为 0。
-                    # 预售加量优先，避免预售订单因原库存低于 10 被调成 0。
-                    if auto_av is not None:
-                        if is_presale:
-                            auto_av = auto_av + 9999
-                            presale_bonus = 9999
-                            desc += "；预售订单库存自动加 9999"
-                        elif auto_av < 10:
-                            low_stock_zero = True
-                            desc += f"；匹配库存 {auto_av} 小于 10，自动调为 0"
-                            auto_av = 0
-                            auto_status = AUTO_STATUS_DONE
-                    if is_presale:
-                        desc = f"预售订单（已开启调库）：{desc}"
-                    # 候选卡片展示最终将采用的库存值（含预售加量/低库存调零）。
-                    av = auto_av
-                    cands = build_candidates(f, e, exact, norm, matcher, pool, run_index,
-                                             top_n=6, auto_match=(st, sku, av, desc))
+                if is_presale:
+                    mode = "已开启" if self.include_presale else "未开启"
+                    desc = f"预售订单（{mode}自动调库）：{desc}"
+                    if not self.include_presale:
+                        auto_status = AUTO_STATUS_PRESALE
+                # 候选卡片展示最终将采用的库存值（含预售加量/低库存调零）。
+                av = auto_av
+                cands = build_candidates(f, e, exact, norm, matcher, pool, run_index,
+                                         top_n=6, auto_match=(st, sku, av, desc))
                 items.append({
                     "row": rec["row"],
                     "sales_sheet": rec.get("sheet", "Sheet1"),
@@ -239,6 +238,8 @@ class AutoMatchWorker(QThread):
                     "is_presale": is_presale,
                     "presale_days": presale_days if is_presale else None,
                     "presale_enabled": presale_enabled,
+                    "presale_bonus_enabled": self.presale_bonus_enabled,
+                    "low_stock_zero_enabled": self.low_stock_zero_enabled,
                     "close_presale": False,
                     "presale_source_rows": presale_meta.get("rows_by_spec", {}).get(spec, []) if is_presale else [],
                     "presale_source_sheet": presale_meta.get("sheet", "") if is_presale else "",
@@ -381,15 +382,26 @@ class MainWindow(QMainWindow):
         action_bar.setMovable(False)
         self.chk_include_presale = QCheckBox("参与预售订单调库")
         self.chk_include_presale.setToolTip("默认关闭；开启后预售订单才会匹配并写入库存")
+        self.chk_presale_bonus = QCheckBox("预售库存+9999")
+        self.chk_presale_bonus.setChecked(True)
+        self.chk_presale_bonus.setToolTip("勾选后，预售订单的自动匹配值增加 9999；关闭后使用原始匹配库存")
+        self.chk_low_stock_zero = QCheckBox("库存<10自动调0")
+        self.chk_low_stock_zero.setChecked(True)
+        self.chk_low_stock_zero.setToolTip("勾选后，普通商品匹配库存小于 10 时自动建议为 0")
         self.btn_manage_mappings = QPushButton("管理历史映射")
         self.btn_manage_mappings.clicked.connect(self.manage_mappings)
         action_bar.addWidget(self.chk_include_presale)
         action_bar.addSeparator()
-        action_bar.addWidget(self.btn_manage_mappings)
         btn_start = QPushButton("▶ 开始匹配")
         btn_start.clicked.connect(self.start_matching)
         self.btn_start = btn_start
+        # 优先保证开始匹配可见；较次要的管理按钮在窄窗口时进入工具栏溢出菜单。
         action_bar.addWidget(btn_start)
+        action_bar.addSeparator()
+        action_bar.addWidget(self.chk_presale_bonus)
+        action_bar.addWidget(self.chk_low_stock_zero)
+        action_bar.addSeparator()
+        action_bar.addWidget(self.btn_manage_mappings)
         self.addToolBar(action_bar)
 
         # 中央三栏
@@ -404,7 +416,10 @@ class MainWindow(QMainWindow):
         self.search.textChanged.connect(self._apply_filter)
         ll.addWidget(self.search)
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["全部状态", "建议", "待手选", "预售单号", "已处理", "已确认"])
+        self.status_filter.addItems([
+            "全部状态", "建议", "待手选", "预售单号",
+            "自动调0", "预售+9999", "已处理", "已确认",
+        ])
         self.status_filter.currentTextChanged.connect(lambda _text: self._apply_filter())
         ll.addWidget(self.status_filter)
 
@@ -433,6 +448,7 @@ class MainWindow(QMainWindow):
         self.listw = QListWidget()
         self.listw.setSelectionMode(QAbstractItemView.SingleSelection)
         self.listw.currentItemChanged.connect(self._on_list_select)
+        self.listw.itemDoubleClicked.connect(self._copy_item_sku)
         self.listw.itemChanged.connect(self._on_item_check_changed)
         ll.addWidget(self.listw)
         left.setMinimumWidth(280)
@@ -486,6 +502,7 @@ class MainWindow(QMainWindow):
         self.stat = {}
         for key, color in (("自动采用", COLOR_CONFIRMED), ("保留原值", COLOR_KEEP),
                            ("调为0", COLOR_ZERO), ("手动输入", COLOR_CUSTOM),
+                           ("自动调0", COLOR_AUTO_ZERO), ("预售+9999", COLOR_PRESALE_BONUS),
                            ("建议", COLOR_SUGGEST), ("待手选", COLOR_PENDING),
                            (AUTO_STATUS_PRESALE, COLOR_PRESALE),
                            ("未处理", COLOR_PENDING)):
@@ -535,6 +552,8 @@ class MainWindow(QMainWindow):
         self.btn_clear_selection.setEnabled(enabled)
         self.btn_batch.setEnabled(enabled)
         self.chk_include_presale.setEnabled(not enabled)
+        self.chk_presale_bonus.setEnabled(not enabled)
+        self.chk_low_stock_zero.setEnabled(not enabled)
         self.chk_close_presale.setEnabled(enabled)
         if not enabled:
             self.chk_close_presale.setVisible(False)
@@ -661,6 +680,8 @@ class MainWindow(QMainWindow):
             include_presale=self.chk_include_presale.isChecked(),
             mapping_memory=self.mapping_memory,
             combo_path=self.combo_path,
+            presale_bonus_enabled=self.chk_presale_bonus.isChecked(),
+            low_stock_zero_enabled=self.chk_low_stock_zero.isChecked(),
         )
         self._worker.progress.connect(lambda v, m: (prog.setValue(v), prog.setLabelText(m)))
         self._worker.failed.connect(lambda e: (prog.close(), self._on_match_failed(e)))
@@ -689,6 +710,14 @@ class MainWindow(QMainWindow):
             any(it.get("is_presale") and it.get("presale_enabled") for it in self.items)
         )
         self.chk_include_presale.blockSignals(False)
+        saved_presale_bonus = next(
+            (it.get("presale_bonus_enabled") for it in self.items
+             if "presale_bonus_enabled" in it), True)
+        saved_low_stock_zero = next(
+            (it.get("low_stock_zero_enabled") for it in self.items
+             if "low_stock_zero_enabled" in it), True)
+        self.chk_presale_bonus.setChecked(bool(saved_presale_bonus))
+        self.chk_low_stock_zero.setChecked(bool(saved_low_stock_zero))
         self._apply_filter(reset=True)
         self._set_controls_enabled(True)
         self.lbl_status.setText(
@@ -728,6 +757,10 @@ class MainWindow(QMainWindow):
                 status_match = it.get("decision") is None and it.get("auto_status") == status_filter
             elif status_filter == AUTO_STATUS_PRESALE:
                 status_match = it.get("is_presale") is True
+            elif status_filter == "自动调0":
+                status_match = bool(it.get("low_stock_zero"))
+            elif status_filter == "预售+9999":
+                status_match = bool(it.get("presale_bonus"))
             else:
                 status_match = True
             return text_match and status_match
@@ -770,14 +803,24 @@ class MainWindow(QMainWindow):
         for i in self.filtered:
             it = self.items[i]
             sym = self._status_symbol(it)
-            if it.get("is_presale") and not it.get("presale_enabled"):
-                text = f"[{sym}] {it['f']}  | 未开启预售调库"
+            tag = " ⚠无备货" if it["no_stock_tag"] and not it["decision"] else ""
+            _should_write, final_value, _action = final_write(it)
+            if (it.get("is_presale") and not it.get("presale_enabled")
+                    and it.get("decision") is None):
+                show_av = it.get("auto_av")
+                auto_tag = " | 预售自动关闭"
             else:
-                tag = " ⚠无备货" if it["no_stock_tag"] and not it["decision"] else ""
-                _should_write, final_value, _action = final_write(it)
-                show_av = "" if final_value is None else str(final_value)
-                close_tag = " | 将关闭预售" if it.get("close_presale") else ""
-                text = f"[{sym}] {it['f']}{tag}{close_tag}  |  库存:{show_av}"
+                show_av = final_value
+                auto_tag = ""
+            show_av = "" if show_av is None else str(show_av)
+            close_tag = " | 将关闭预售" if it.get("close_presale") else ""
+            rule_tags = []
+            if it.get("low_stock_zero"):
+                rule_tags.append("自动调0")
+            if it.get("presale_bonus"):
+                rule_tags.append("预售+9999")
+            rule_tag = f" | {' / '.join(rule_tags)}" if rule_tags else ""
+            text = f"[{sym}] {it['f']}{tag}{close_tag}{auto_tag}{rule_tag}  |  库存:{show_av}"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, i)
             if self._is_batch_target(it):
@@ -807,6 +850,18 @@ class MainWindow(QMainWindow):
         else:
             self.selected_indices.discard(index)
         self._refresh_selection_label()
+
+    def _copy_item_sku(self, item):
+        """双击左侧列表行时复制销售资料 F 列货号。"""
+        index = item.data(Qt.UserRole)
+        if index is None:
+            return
+        index = int(index)
+        if not (0 <= index < len(self.items)):
+            return
+        sku = str(self.items[index].get("f", ""))
+        QApplication.clipboard().setText(sku)
+        self.statusBar().showMessage(f"已复制货号：{sku}", 3000)
 
     def _select_all_visible(self):
         self.selected_indices.update(
@@ -858,10 +913,11 @@ class MainWindow(QMainWindow):
             if it.get("presale_enabled"):
                 self.hint.setText("预售调库已开启：可以确认库存，也可以单独勾选是否关闭预售")
             else:
-                self.hint.setText("预售调库当前关闭：不会改库存；仍可勾选关闭预售")
+                self.hint.setText(
+                    "预售自动调库当前关闭：不会自动写入；仍可手动采用匹配值、保留原值、调0或输入库存")
             self._render_cards(it)
             for button in (self.btn_adopt, self.btn_keep, self.btn_zero, self.btn_custom):
-                button.setEnabled(self._in_review and bool(it.get("presale_enabled")))
+                button.setEnabled(self._in_review)
             self._refresh_stats()
             return
 
@@ -898,7 +954,7 @@ class MainWindow(QMainWindow):
         cands = it["candidates"] or []
         if not cands:
             if it.get("is_presale") and not it.get("presale_enabled"):
-                text = "预售调库未开启，不参与库存调整；可单独关闭预售。"
+                text = "预售自动调库未开启；仍可使用保留原值、调为0或手动输入库存。"
             else:
                 text = "无候选。可点[匹配为0]或[自定义数值]或[跳过]。"
             lbl = QLabel(text)
@@ -955,9 +1011,6 @@ class MainWindow(QMainWindow):
 
     def _decide_adopt(self):
         it = self.items[self.idx]
-        if it.get("is_presale") and not it.get("presale_enabled"):
-            QMessageBox.information(self, "提示", "预售单号不参与库存调整")
-            return
         if self._selected_card is not None:
             apply_decision(it, DECISION_ADOPT, value=self._selected_card.av,
                            auto_sku=self._selected_card.sku)
@@ -974,25 +1027,16 @@ class MainWindow(QMainWindow):
 
     def _decide_keep(self):
         it = self.items[self.idx]
-        if it.get("is_presale") and not it.get("presale_enabled"):
-            QMessageBox.information(self, "提示", "预售单号不参与库存调整")
-            return
         apply_decision(it, DECISION_KEEP)
         self._after_decision()
 
     def _decide_zero(self):
         it = self.items[self.idx]
-        if it.get("is_presale") and not it.get("presale_enabled"):
-            QMessageBox.information(self, "提示", "预售单号不参与库存调整")
-            return
         apply_decision(it, DECISION_ZERO)
         self._after_decision()
 
     def _decide_custom(self):
         it = self.items[self.idx]
-        if it.get("is_presale") and not it.get("presale_enabled"):
-            QMessageBox.information(self, "提示", "预售单号不参与库存调整")
-            return
         cur = it["auto_av"] if it["auto_av"] is not None else 0
         val, ok = QInputDialog.getInt(self, "手动输入库存", "输入非负整数:", cur, 0, 999999999)
         if not ok:
@@ -1021,13 +1065,9 @@ class MainWindow(QMainWindow):
             return
 
         eligible = []
-        skipped_presale = 0
         skipped_no_value = 0
         for i in indices:
             it = self.items[i]
-            if it.get("is_presale") and not it.get("presale_enabled"):
-                skipped_presale += 1
-                continue
             if decision == DECISION_ADOPT and it.get("auto_av") is None:
                 skipped_no_value += 1
                 continue
@@ -1067,8 +1107,6 @@ class MainWindow(QMainWindow):
             self._refresh_stats()
             self._show_current()
         msg = f"已批量处理 {changed} 行"
-        if skipped_presale:
-            msg += f"；{skipped_presale} 行预售调库未开启，未改库存"
         if skipped_no_value:
             msg += f"；{skipped_no_value} 行没有自动匹配值，未采用"
         if not changed:
@@ -1324,6 +1362,14 @@ class MainWindow(QMainWindow):
             any(it.get("is_presale") and it.get("presale_enabled") for it in self.items)
         )
         self.chk_include_presale.blockSignals(False)
+        saved_presale_bonus = next(
+            (it.get("presale_bonus_enabled") for it in self.items
+             if "presale_bonus_enabled" in it), True)
+        saved_low_stock_zero = next(
+            (it.get("low_stock_zero_enabled") for it in self.items
+             if "low_stock_zero_enabled" in it), True)
+        self.chk_presale_bonus.setChecked(bool(saved_presale_bonus))
+        self.chk_low_stock_zero.setChecked(bool(saved_low_stock_zero))
         self._apply_filter(reset=True)
         self._set_controls_enabled(True)
         n = self._first_unresolved()

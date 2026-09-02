@@ -21,7 +21,10 @@ LEGACY_DECISIONS = {
 AUTO_DONE = "已确认"
 PRESALE_STATUS = "预售单号"
 REVIEW_STATUSES = ("建议", "待手选")
-SUMMARY_KEYS = ("自动采用", "保留原值", "调为0", "手动输入", "建议", "待手选", "预售单号", "未处理")
+SUMMARY_KEYS = (
+    "自动采用", "保留原值", "调为0", "手动输入",
+    "自动调0", "预售+9999", "建议", "待手选", "预售单号", "未处理",
+)
 
 
 def _non_negative_int(value):
@@ -38,8 +41,6 @@ def _non_negative_number(value):
 
 def apply_decision(row, decision, *, value=None, auto_sku=None):
     """将一个复核动作写入行字典，并返回该行。"""
-    if row.get("is_presale") and not row.get("presale_enabled"):
-        raise ValueError("预售单号不允许调整库存")
     if decision not in ACTION_LABELS:
         raise ValueError(f"未知复核动作: {decision}")
 
@@ -80,7 +81,8 @@ def final_write(row):
     decision = row.get("decision")
     old_value = row.get("i_old")
 
-    if row.get("is_presale") and not row.get("presale_enabled"):
+    if (row.get("is_presale") and not row.get("presale_enabled")
+            and row.get("decision") is None):
         return False, old_value, "预售单号-不参与调库"
 
     if decision == DECISION_ADOPT:
@@ -119,8 +121,16 @@ def summarize_items(items):
     """按最终动作和自动状态汇总行数，始终返回固定键。"""
     summary = {key: 0 for key in SUMMARY_KEYS}
     for row in items:
-        if ((row.get("is_presale") and not row.get("presale_enabled"))
-                or row.get("auto_status") == PRESALE_STATUS):
+        if row.get("low_stock_zero"):
+            summary["自动调0"] += 1
+        if (row.get("presale_bonus")
+                and (row.get("presale_enabled")
+                     or row.get("decision") == DECISION_ADOPT)):
+            summary["预售+9999"] += 1
+
+        if (row.get("is_presale") and row.get("decision") is None
+                and (not row.get("presale_enabled")
+                     or row.get("auto_status") == PRESALE_STATUS)):
             summary[PRESALE_STATUS] += 1
             continue
         _should_write, _value, action = final_write(row)

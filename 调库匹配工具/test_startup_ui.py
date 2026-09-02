@@ -101,9 +101,9 @@ def test_presale_filter_can_switch_from_non_presale_row(monkeypatch):
     assert window.idx == 1
     window.idx = window.filtered[0]
     window._show_current()
-    assert not window.btn_adopt.isEnabled()
-    assert not window.btn_keep.isEnabled()
-    assert not window.btn_zero.isEnabled()
-    assert not window.btn_custom.isEnabled()
+    assert window.btn_adopt.isEnabled()
+    assert window.btn_keep.isEnabled()
+    assert window.btn_zero.isEnabled()
+    assert window.btn_custom.isEnabled()
     window.close()
     app.processEvents()

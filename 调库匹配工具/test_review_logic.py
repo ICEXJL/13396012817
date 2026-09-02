@@ -81,6 +81,7 @@ def test_invalid_adopt_does_not_leave_a_partial_decision():
 
 def test_summary_counts_explicit_actions_and_auto_defaults():
     rows = [item(), item("建议"), item("待手选")]
+    rows[0]["low_stock_zero"] = True
     apply_decision(rows[1], DECISION_KEEP)
     apply_decision(rows[2], DECISION_ZERO)
     assert summarize_items(rows) == {
@@ -88,6 +89,8 @@ def test_summary_counts_explicit_actions_and_auto_defaults():
         "保留原值": 1,
         "调为0": 1,
         "手动输入": 0,
+        "自动调0": 1,
+        "预售+9999": 0,
         "建议": 0,
         "待手选": 0,
         "预售单号": 0,
@@ -95,14 +98,28 @@ def test_summary_counts_explicit_actions_and_auto_defaults():
     }
 
 
-def test_presale_item_never_writes_or_needs_review():
-    """预售单号必须保持原库存，且不属于待处理调库项。"""
+def test_disabled_presale_item_stays_pending_without_manual_decision():
+    """默认关闭自动预售调库时，未手动处理的预售行保持原库存。"""
     presale = item(auto_status="预售单号", auto_av=None, i_old=12)
     presale["is_presale"] = True
 
     assert final_write(presale) == (False, 12, "预售单号-不参与调库")
     assert unresolved_items([presale]) == []
     assert summarize_items([presale])["预售单号"] == 1
+
+
+def test_disabled_presale_item_can_be_manually_written():
+    """自动预售调库关闭时，运营仍可在复核阶段手动采用匹配库存。"""
+    presale = item(auto_status="预售单号", auto_av=10008, i_old=12)
+    presale["is_presale"] = True
+    presale["presale_enabled"] = False
+    presale["presale_bonus"] = 9999
+
+    apply_decision(presale, DECISION_ADOPT)
+
+    assert final_write(presale) == (True, 10008, "采用自动值")
+    assert summarize_items([presale])["预售单号"] == 0
+    assert summarize_items([presale])["预售+9999"] == 1
 
 
 def test_enabled_presale_item_can_be_reviewed_and_written():
